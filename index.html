@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Road Drift - Multiplayer Edition</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body { margin: 0; background: #0b0f13; overflow: hidden; font-family: 'Segoe UI', sans-serif; color: #fff; }
+        canvas { display: block; }
+        
+        /* UI Elements */
+        #ui, #chat-container { position: absolute; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 8px; border: 1px solid #00ffcc; z-index: 10; pointer-events: auto; }
+        #ui { top: 20px; left: 20px; min-width: 200px; box-shadow: 0 0 15px rgba(0,255,204,0.2); }
+        #chat-container { bottom: 20px; left: 20px; width: 300px; display: flex; flex-direction: column; border: 1px solid #333; }
+        #chat-box { height: 150px; overflow-y: auto; font-size: 13px; margin-bottom: 10px; color: #ccc; }
+        #chat-input { background: #000; border: 1px solid #00ffcc; color: #00ffcc; padding: 8px; border-radius: 4px; outline: none; display: none; }
+        
+        /* Menu Overlay */
+        #menu { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #0a0a0a; display: flex; justify-content: center; align-items: center; z-index: 100; }
+        .box { background: #111; padding: 40px; border-radius: 20px; border: 1px solid #00ffcc; text-align: center; width: 350px; box-shadow: 0 0 50px rgba(0,255,204,0.1); }
+        input { background: #000; border: 1px solid #333; color: #00ffcc; padding: 12px; border-radius: 5px; width: 100%; margin: 10px 0; outline: none; text-align: center; font-size: 16px; }
+        button { background: #00ffcc; color: #000; border: none; padding: 14px 0; width: 100%; cursor: pointer; font-weight: bold; border-radius: 5px; margin-top: 10px; text-transform: uppercase; letter-spacing: 1px; transition: 0.3s; }
+        button:hover { background: #00ccaa; transform: scale(1.02); }
+        
+        .stat { color: #00ffcc; font-family: monospace; font-size: 18px; }
+        .label { font-size: 10px; color: #666; text-transform: uppercase; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+    <div id="menu">
+        <div class="box">
+            <h1 style="color: #00ffcc; margin: 0 0 20px 0; letter-spacing: 8px;">DRIFTY</h1>
+            <input type="text" id="username" placeholder="DRIVER NAME" maxlength="12">
+            <button onclick="startMode('host')">Host Lobby</button>
+            <div style="margin: 15px; color: #444;">— OR —</div>
+            <input type="text" id="join-id" placeholder="PASTE LOBBY ID">
+            <button style="background:#00ccff" onclick="startMode('join')">Join Lobby</button>
+        </div>
+    </div>
+
+    <div id="ui">
+        <div class="label">Lobby ID (Click to Copy)</div>
+        <div id="display-id" style="cursor:pointer; font-weight:bold; color:#fff;" onclick="copyID()">---</div>
+        <hr style="border:0; border-top:1px solid #222; margin:10px 0;">
+        <div class="label">Speed</div>
+        <div class="stat"><span id="speed-val">0</span> KM/H</div>
+        <div class="label">Players Online</div>
+        <div id="player-list" style="font-size: 12px; margin-top:5px;"></div>
+    </div>
+
+    <div id="chat-container">
+        <div id="chat-box"></div>
+        <input type="text" id="chat-input" placeholder="Type message & Enter...">
+    </div>
+
+    <canvas id="game"></canvas>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const speedEl = document.getElementById('speed-val');
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// --- MULTIPLAYER CORE ---
+const peer = new Peer();
+let connections = {}, otherPlayers = {}, myUsername = "";
+let myColor = `hsl(${Math.random() * 360}, 80%, 60%)`;
+
+peer.on('open', id => document.getElementById('display-id').innerText = id);
+
+// --- DRIFT ENGINE v2.0 (MODIFIED FOR SLOW/BIG DRIFT) ---
+const car = {
+    x: canvas.width / 2,
+    y: canvas.height / 2,
+    angle: 0,
+    speed: 0,
+    vX: 0,
+    vY: 0,
+    drift: 0.85, // Lowered for bigger/longer drifts (was 0.93)
+    accel: 0.15, // Slower acceleration for heavy feel
+    friction: 0.99 // Higher friction for slower speed decay
+};
+
+const keys = {};
+window.onkeydown = (e) => { if(document.activeElement.id !== 'chat-input') keys[e.key.toLowerCase()] = true; };
+window.onkeyup = (e) => { keys[e.key.toLowerCase()] = false; };
+
+let particles = [];
+
+// Handle connections
+peer.on('connection', conn => {
+    setupConn(conn);
+});
+
+function setupConn(conn) {
+    connections[conn.peer] = conn;
+    conn.on('data', data => {
+        if(data.type === 'move') {
+            otherPlayers[conn.peer] = data;
+        } else if(data.type === 'chat') {
+            addChatMessage(data.name, data.msg, data.color);
+        }
+    });
+    conn.on('close', () => { delete otherPlayers[conn.peer]; updateLeaderboard(); });
+}
+
+function startMode(mode) {
+    myUsername = document.getElementById('username').value || "Driver";
+    if(mode === 'join') {
+        const id = document.getElementById('join-id').value.trim();
+        if(!id) return;
+        const conn = peer.connect(id);
+        conn.on('open', () => {
+            setupConn(conn);
+            document.getElementById('menu').style.display = 'none';
+            loop();
+        });
+    } else {
+        document.getElementById('menu').style.display = 'none';
+        loop();
+    }
+}
+
+function update() {
+    // Steering
+    if (keys['a']) car.angle -= 0.05 * (Math.min(Math.abs(car.speed), 5) / 5);
+    if (keys['d']) car.angle += 0.05 * (Math.min(Math.abs(car.speed), 5) / 5);
+
+    // Gas / Brake
+    if (keys['w']) car.speed = Math.min(car.speed + car.accel, 7);
+    else if (keys['s']) car.speed = Math.max(car.speed - 0.2, -3);
+    else car.speed *= car.friction;
+
+    // Drifting Physics (Zero-File Logic)
+    const targetVX = Math.cos(car.angle) * car.speed;
+    const targetVY = Math.sin(car.angle) * car.speed;
+
+    car.vX += (targetVX - car.vX) * (1 - car.drift);
+    car.vY += (targetVY - car.vY) * (1 - car.drift);
+
+    car.x += car.vX;
+    car.y += car.vY;
+
+    // Screen Wrap
+    if(car.x > canvas.width) car.x = 0; if(car.x < 0) car.x = canvas.width;
+    if(car.y > canvas.height) car.y = 0; if(car.y < 0) car.y = canvas.height;
+
+    // Drift Detection & Particles
+    const isDrifting = Math.sqrt((targetVX-car.vX)**2 + (targetVY-car.vY)**2) > 1.5;
+    if (isDrifting) {
+        particles.push({
+            x: car.x - Math.cos(car.angle) * 15,
+            y: car.y - Math.sin(car.angle) * 15,
+            size: 5 + Math.random() * 5,
+            life: 1.0
+        });
+    }
+    
+    particles.forEach(p => { p.life -= 0.02; p.size += 0.3; });
+    particles = particles.filter(p => p.life > 0);
+
+    speedEl.innerText = Math.round(Math.abs(car.speed) * 20);
+
+    // Broadcast position
+    Object.values(connections).forEach(c => {
+        if(c.open) c.send({ 
+            type: 'move', 
+            x: car.x, y: car.y, angle: car.angle, 
+            username: myUsername, color: myColor,
+            drifting: isDrifting 
+        });
+    });
+}
+
+function draw() {
+    ctx.fillStyle = "#0b0f13";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    // Grid Lines
+    ctx.strokeStyle = "#ffffff08";
+    ctx.lineWidth = 1;
+    for(let i=0; i<canvas.width; i+=100) { ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke(); }
+    for(let i=0; i<canvas.height; i+=100) { ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke(); }
+
+    // Draw Particles
+    particles.forEach(p => {
+        ctx.fillStyle = `rgba(150, 150, 150, ${p.life * 0.4})`;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+    });
+
+    // Draw Other Players
+    for(let id in otherPlayers) {
+        let p = otherPlayers[id];
+        renderCar(p.x, p.y, p.angle, p.color, p.username);
+    }
+
+    // Draw Local Car
+    renderCar(car.x, car.y, car.angle, myColor, myUsername, true);
+}
+
+function renderCar(x, y, angle, color, name, isLocal) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    
+    if(isLocal) { ctx.shadowBlur = 15; ctx.shadowColor = color; }
+
+    // Car Body
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(-20, -10, 40, 20, 4);
+    ctx.fill();
+    
+    // Windshield
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(5, -8, 10, 16);
+    
+    // Tail lights
+    ctx.fillStyle = "#ff0000";
+    ctx.fillRect(-20, -9, 3, 5);
+    ctx.fillRect(-20, 4, 3, 5);
+
+    ctx.restore();
+
+    // Name Tag
+    ctx.fillStyle = "white";
+    ctx.font = "bold 12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(name, x, y - 25);
+}
+
+// Chat System
+const chatInput = document.getElementById('chat-input');
+const chatBox = document.getElementById('chat-box');
+
+window.addEventListener('keydown', e => {
+    if(e.key === 'Enter') {
+        if(document.activeElement === chatInput) {
+            const msg = chatInput.value.trim();
+            if(msg) {
+                addChatMessage(myUsername, msg, myColor);
+                Object.values(connections).forEach(c => c.send({ type: 'chat', name: myUsername, msg: msg, color: myColor }));
+            }
+            chatInput.value = "";
+            chatInput.style.display = 'none';
+            canvas.focus();
+        } else {
+            chatInput.style.display = 'block';
+            chatInput.focus();
+        }
+    }
+});
+
+function addChatMessage(name, msg, color) {
+    const div = document.createElement('div');
+    div.innerHTML = `<span style="color:${color}; font-weight:bold;">${name}:</span> ${msg}`;
+    chatBox.appendChild(div);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function updateLeaderboard() {
+    const list = document.getElementById('player-list');
+    let names = `<div>• ${myUsername} (You)</div>`;
+    for(let id in otherPlayers) names += `<div>• ${otherPlayers[id].username}</div>`;
+    list.innerHTML = names;
+}
+
+function loop() {
+    update();
+    draw();
+    updateLeaderboard();
+    requestAnimationFrame(loop);
+}
+
+function copyID() {
+    const id = document.getElementById('display-id').innerText;
+    navigator.clipboard.writeText(id);
+    alert("Lobby ID Copied! Share this with your friends.");
+}
+</script>
+</body>
+</html>
